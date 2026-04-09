@@ -14067,6 +14067,16 @@ var pluginPersistedDataSchema = external_exports.object({
   syncedNotes: external_exports.record(external_exports.string(), pluginSyncRecordSchema).default({})
 });
 
+// packages/contracts/src/slug.ts
+var COMBINING_MARKS_PATTERN = /[\u0300-\u036f]/g;
+function foldVietnameseToAscii(value) {
+  return value.normalize("NFKD").replace(COMBINING_MARKS_PATTERN, "").replace(/đ/g, "d").replace(/Đ/g, "D");
+}
+function slugifyText(input) {
+  const normalized = foldVietnameseToAscii(input).trim().replace(/&/g, " va ").replace(/[’'`]/g, "").replace(/[–—]+/g, "-").replace(/[/:]+/g, " ").toLowerCase();
+  return normalized.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-") || "note";
+}
+
 // apps/obsidian-plugin/src/main.ts
 var DEFAULT_SETTINGS = {
   serverUrl: "",
@@ -14188,7 +14198,12 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     await this.saveData(payload);
   }
   async syncPublishedNotes() {
-    const files = this.collectCandidateFiles().filter((file2) => this.frontmatterFor(file2)?.publish === true);
+    const files = (await Promise.all(
+      this.collectCandidateFiles().map(async (file2) => ({
+        file: file2,
+        frontmatter: await this.reliableFrontmatterFor(file2)
+      }))
+    )).filter(({ frontmatter }) => frontmatter?.publish === true).map(({ file: file2 }) => file2);
     await this.syncFiles(files, {
       includeDeleted: true,
       successNotice: true
@@ -14522,9 +14537,10 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
   async collectDeletedNotes(currentFiles) {
     const currentIds = /* @__PURE__ */ new Set();
     for (const file2 of currentFiles) {
-      const frontmatter = this.frontmatterFor(file2);
-      if (frontmatter?.garden_id) {
-        currentIds.add(frontmatter.garden_id);
+      const frontmatter = await this.reliableFrontmatterFor(file2);
+      const noteId = frontmatter?.garden_id ?? this.findTrackedRecordByPath(file2.path)?.clientNoteId;
+      if (noteId) {
+        currentIds.add(noteId);
       }
     }
     return Object.values(this.syncedNotes).filter((record2) => record2.status !== "deleted" && record2.status !== "unpublish_queued" && !currentIds.has(record2.clientNoteId)).map((record2) => ({
@@ -14594,7 +14610,8 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
         return;
       }
       await this.runSilently(async () => {
-        if (await this.isPublishedNote(file2)) {
+        const frontmatter = await this.reliableFrontmatterFor(file2);
+        if (frontmatter?.publish === true) {
           await this.syncFiles([file2], {
             includeDeleted: false,
             successNotice: false
@@ -15024,21 +15041,14 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
   }
   frontmatterFor(file2) {
     const cached2 = this.app.metadataCache.getFileCache(file2)?.frontmatter;
-    if (!cached2) {
-      return null;
-    }
-    const candidate = {
-      publish: cached2.publish === true,
-      slug: typeof cached2.slug === "string" ? cached2.slug : void 0,
-      excerpt: typeof cached2.excerpt === "string" ? cached2.excerpt : void 0,
-      tags: Array.isArray(cached2.tags) ? cached2.tags.filter((tag) => typeof tag === "string") : void 0,
-      garden_id: typeof cached2.garden_id === "string" ? cached2.garden_id : void 0
-    };
-    const parsed = noteFrontmatterSchema.safeParse(candidate);
-    return parsed.success ? parsed.data : null;
+    return normalizeNoteFrontmatter(cached2);
+  }
+  async reliableFrontmatterFor(file2) {
+    const raw = await this.app.vault.cachedRead(file2);
+    return parseNoteFrontmatterFromRaw(raw);
   }
   async isPublishedNote(file2) {
-    return this.frontmatterFor(file2)?.publish === true;
+    return (await this.reliableFrontmatterFor(file2))?.publish === true;
   }
   async buildPublishBundle(file2) {
     const frontmatter = this.frontmatterFor(file2);
@@ -15290,6 +15300,34 @@ function ensureTrailingSlash(input) {
 function stripFrontmatter(raw) {
   return raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
 }
+function normalizeNoteFrontmatter(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const frontmatter = raw;
+  const rawTags = frontmatter.tags;
+  const candidate = {
+    publish: frontmatter.publish === true,
+    slug: typeof frontmatter.slug === "string" ? frontmatter.slug : void 0,
+    excerpt: typeof frontmatter.excerpt === "string" ? frontmatter.excerpt : void 0,
+    tags: Array.isArray(rawTags) ? rawTags.filter((tag) => typeof tag === "string") : void 0,
+    garden_id: typeof frontmatter.garden_id === "string" ? frontmatter.garden_id : void 0
+  };
+  const parsed = noteFrontmatterSchema.safeParse(candidate);
+  return parsed.success ? parsed.data : null;
+}
+function parseNoteFrontmatterFromRaw(raw) {
+  const info = (0, import_obsidian.getFrontMatterInfo)(raw);
+  if (!info.exists || !info.frontmatter.trim()) {
+    return null;
+  }
+  try {
+    const parsed = (0, import_obsidian.parseYaml)(info.frontmatter);
+    return normalizeNoteFrontmatter(parsed);
+  } catch {
+    return null;
+  }
+}
 function extractTitle(markdown) {
   const heading = markdown.match(/^#\s+(.+)$/m);
   return heading?.[1]?.trim();
@@ -15333,8 +15371,7 @@ function extractExcerpt(markdown) {
   return candidate.replace(/!\[\[([^\]]+)\]\]/g, "").replace(/\[\[([^\]]+)\]\]/g, "$1").replace(/!\[([^\]]*)\]\(([^)]+)\)/g, "$1").replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1").replace(/\[\![^\]]+\]/g, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 180);
 }
 function slugify2(input) {
-  const value = input.trim().toLowerCase();
-  return value.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-") || "note";
+  return slugifyText(input);
 }
 async function sha256(input) {
   const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
