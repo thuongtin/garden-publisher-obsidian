@@ -1,0 +1,10 @@
+{
+  "id": "garden-publisher",
+  "name": "Garden Publisher",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Publish notes marked with publish: true to a shared Cloudflare-native notes garden.",
+  "author": "Ethan",
+  "authorUrl": "https://notes-garden.ecom.io.vn",
+  "isDesktopOnly": false
+}
