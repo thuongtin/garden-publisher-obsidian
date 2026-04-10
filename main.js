@@ -14296,6 +14296,9 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     const uniqueFiles = dedupeFiles(files);
     const syncableFiles = uniqueFiles.filter((file2) => !this.inFlightPaths.has(file2.path));
     const deleted = options.includeDeleted ? await this.collectDeletedNotes(uniqueFiles) : [];
+    if (deleted.length > 0) {
+      throw new Error("Bulk unpublish via sync is disabled. Unpublish notes individually.");
+    }
     if (syncableFiles.length === 0 && deleted.length === 0) {
       if (options.successNotice) {
         new import_obsidian.Notice("No notes to sync.");
@@ -14382,6 +14385,8 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       }
       if (acceptedBundles.length > 0) {
         await this.uploadMissingAssets(syncResponse.batchId, syncResponse.missingAssets, acceptedBundles);
+      }
+      if (acceptedBundles.length > 0 || syncResponse.deletedAccepted.length > 0) {
         await this.requestJson(
           this.buildApiUrl(`/v1/publish/finalize/${syncResponse.batchId}`),
           {
