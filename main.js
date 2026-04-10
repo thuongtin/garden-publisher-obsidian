@@ -13858,9 +13858,14 @@ var missingAssetSchema = external_exports.object({
   uploadUrl: external_exports.string().trim().min(1),
   expectedSourcePath: external_exports.string().trim().min(1)
 });
+var publishSyncErrorCodeSchema = external_exports.enum([
+  "SOURCE_PATH_IDENTITY_CONFLICT",
+  "DUPLICATE_REPAIR_REQUIRED",
+  "PROCESSING_FAILED"
+]);
 var syncErrorSchema = external_exports.object({
   clientNoteId: gardenIdSchema.optional(),
-  code: external_exports.string().trim().min(1),
+  code: publishSyncErrorCodeSchema,
   message: external_exports.string().trim().min(1)
 });
 var publishSyncResponseSchema = external_exports.object({
@@ -13918,6 +13923,7 @@ var publishStateDocumentSchema = external_exports.object({
   syncAction: external_exports.enum(["upsert", "delete"]).nullable(),
   syncItemStatus: external_exports.enum(["accepted", "assets_pending", "queued", "processing", "completed", "failed"]).nullable(),
   lastContentHash: external_exports.string().trim().min(1).nullable(),
+  lastErrorCode: publishSyncErrorCodeSchema.nullable(),
   lastError: external_exports.string().trim().min(1).nullable(),
   publicUrl: external_exports.string().trim().min(1).nullable(),
   syncUpdatedAt: external_exports.iso.datetime().nullable(),
@@ -14059,6 +14065,7 @@ var pluginSyncRecordSchema = external_exports.object({
   publicUrl: external_exports.string().trim().min(1).optional(),
   status: external_exports.enum(["queued", "synced", "deleted", "failed", "syncing", "unpublish_queued"]),
   remoteState: external_exports.enum(["processing", "published", "deleted", "failed", "hidden"]).optional(),
+  lastErrorCode: publishSyncErrorCodeSchema.optional(),
   lastError: external_exports.string().trim().min(1).optional(),
   updatedAt: external_exports.iso.datetime()
 });
@@ -14117,6 +14124,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
   metadataChangeEventRef = null;
   async onload() {
     await this.loadPluginState();
+    await this.reconcileLocalSyncedNotes();
     this.initializeStatusBar();
     this.addSettingTab(new GardenPublisherSettingTab(this.app, this));
     this.addCommand({
@@ -14186,9 +14194,9 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
   }
   async loadPluginState() {
     const raw = await this.loadData();
-    const parsed = pluginPersistedDataSchema.parse(normalizePersistedData(raw));
-    this.settings = pluginSettingsSchema.parse(parsed.settings);
-    this.syncedNotes = parsed.syncedNotes;
+    const normalized = normalizePersistedData(raw);
+    this.settings = normalizePluginSettings(normalized.settings);
+    this.syncedNotes = normalizeSyncedNotes(normalized.syncedNotes);
   }
   async savePluginState() {
     const payload = {
@@ -14236,7 +14244,10 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     await this.runSilently(async () => {
       await this.refreshPublishState({ force: true });
     });
-    const currentPublishedCount = this.collectCandidateFiles().filter((file2) => this.frontmatterFor(file2)?.publish === true).length;
+    const currentPublishedFlags = await Promise.all(
+      this.collectCandidateFiles().map(async (file2) => (await this.reliableFrontmatterFor(file2))?.publish === true)
+    );
+    const currentPublishedCount = currentPublishedFlags.filter(Boolean).length;
     const trackedCount = Object.values(this.syncedNotes).filter((record2) => record2.status !== "deleted").length;
     const descriptor = this.describeCurrentNoteStatus();
     new import_obsidian.Notice(`${currentPublishedCount} note(s) marked publish: true, ${trackedCount} note(s) tracked locally. ${descriptor.label}.`);
@@ -14247,7 +14258,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice("No active note.");
       return;
     }
-    const frontmatter = this.frontmatterFor(file2);
+    const frontmatter = await this.reliableFrontmatterFor(file2);
     const noteId = frontmatter?.garden_id ?? this.findTrackedRecordByPath(file2.path)?.clientNoteId;
     if (!noteId) {
       new import_obsidian.Notice("This note has not been synced yet.");
@@ -14283,6 +14294,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       this.inFlightPaths.add(file2.path);
     }
     let bundles = [];
+    let acceptedBundles = [];
     try {
       bundles = await Promise.all(syncableFiles.map((file2) => this.buildPublishBundle(file2)));
       if (bundles.length === 0 && deleted.length === 0) {
@@ -14316,18 +14328,48 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           body: JSON.stringify(syncPayload)
         })
       );
-      await this.uploadMissingAssets(syncResponse.batchId, syncResponse.missingAssets, bundles);
-      await this.requestJson(
-        this.buildApiUrl(`/v1/publish/finalize/${syncResponse.batchId}`),
-        {
-          method: "POST",
-          contentType: "application/json",
-          body: JSON.stringify({})
-        },
-        finalizeBatchResponseSchema.parse
-      );
-      const queuedAt = (/* @__PURE__ */ new Date()).toISOString();
+      const errorByNoteId = new Map(syncResponse.errors.flatMap((error48) => error48.clientNoteId ? [[error48.clientNoteId, error48]] : []));
+      const acceptedNoteIds = new Set(syncResponse.accepted.map((item) => item.clientNoteId));
+      acceptedBundles = bundles.filter((bundle) => acceptedNoteIds.has(bundle.note.clientNoteId));
+      const preflightFailedAt = (/* @__PURE__ */ new Date()).toISOString();
       for (const bundle of bundles) {
+        const syncError = errorByNoteId.get(bundle.note.clientNoteId);
+        if (!syncError) {
+          continue;
+        }
+        this.runtimeStatuses.set(bundle.note.clientNoteId, {
+          status: "failed",
+          updatedAt: preflightFailedAt,
+          message: syncError.message
+        });
+        this.syncedNotes[bundle.note.clientNoteId] = {
+          clientNoteId: bundle.note.clientNoteId,
+          sourcePath: bundle.note.sourcePath,
+          slug: bundle.note.slug,
+          title: bundle.note.title,
+          contentHash: bundle.note.contentHash,
+          publicUrl: this.syncedNotes[bundle.note.clientNoteId]?.publicUrl,
+          status: "failed",
+          remoteState: this.syncedNotes[bundle.note.clientNoteId]?.remoteState,
+          lastErrorCode: syncError.code,
+          lastError: syncError.message,
+          updatedAt: preflightFailedAt
+        };
+      }
+      if (acceptedBundles.length > 0) {
+        await this.uploadMissingAssets(syncResponse.batchId, syncResponse.missingAssets, acceptedBundles);
+        await this.requestJson(
+          this.buildApiUrl(`/v1/publish/finalize/${syncResponse.batchId}`),
+          {
+            method: "POST",
+            contentType: "application/json",
+            body: JSON.stringify({})
+          },
+          finalizeBatchResponseSchema.parse
+        );
+      }
+      const queuedAt = (/* @__PURE__ */ new Date()).toISOString();
+      for (const bundle of acceptedBundles) {
         const existing = this.syncedNotes[bundle.note.clientNoteId];
         this.runtimeStatuses.delete(bundle.note.clientNoteId);
         this.syncedNotes[bundle.note.clientNoteId] = {
@@ -14339,6 +14381,8 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           publicUrl: existing?.publicUrl ?? this.buildPublicUrl(bundle.note.slug),
           status: "queued",
           remoteState: existing?.remoteState,
+          lastErrorCode: void 0,
+          lastError: void 0,
           updatedAt: queuedAt
         };
       }
@@ -14357,19 +14401,24 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           publicUrl: existing?.publicUrl,
           status: "unpublish_queued",
           remoteState: existing?.remoteState,
+          lastErrorCode: void 0,
+          lastError: void 0,
           updatedAt: queuedAt
         };
       }
       await this.savePluginState();
       this.renderStatusBar();
-      this.schedulePublishStateRefresh();
+      if (acceptedBundles.length > 0 || deleted.length > 0) {
+        this.schedulePublishStateRefresh();
+      }
       if (options.successNotice) {
-        new import_obsidian.Notice(`Queued ${bundles.length} note(s) and ${deleted.length} deletion(s) for publish.`);
+        const preflightErrorCount = syncResponse.errors.length;
+        new import_obsidian.Notice(`Queued ${acceptedBundles.length} note(s) and ${deleted.length} deletion(s) for publish.${preflightErrorCount > 0 ? ` ${preflightErrorCount} note(s) need attention.` : ""}`);
       }
     } catch (error48) {
       const failedAt = (/* @__PURE__ */ new Date()).toISOString();
       const detail = formatErrorMessage(error48);
-      for (const bundle of bundles) {
+      for (const bundle of acceptedBundles.length > 0 ? acceptedBundles : bundles) {
         this.runtimeStatuses.set(bundle.note.clientNoteId, {
           status: "failed",
           updatedAt: failedAt,
@@ -14384,6 +14433,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           publicUrl: this.syncedNotes[bundle.note.clientNoteId]?.publicUrl ?? this.buildPublicUrl(bundle.note.slug),
           status: "failed",
           remoteState: this.syncedNotes[bundle.note.clientNoteId]?.remoteState,
+          lastErrorCode: this.syncedNotes[bundle.note.clientNoteId]?.lastErrorCode,
           lastError: detail,
           updatedAt: failedAt
         };
@@ -14442,7 +14492,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     if (this.inFlightPaths.has(file2.path)) {
       return;
     }
-    const frontmatter = this.frontmatterFor(file2);
+    const frontmatter = await this.reliableFrontmatterFor(file2);
     const gardenId = frontmatter?.garden_id ?? this.findTrackedRecordByPath(file2.path)?.clientNoteId;
     if (!gardenId) {
       if (showNotice) {
@@ -14474,6 +14524,10 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           body: JSON.stringify(payload)
         })
       );
+      if (syncResponse.deletedAccepted.length === 0) {
+        const syncError = syncResponse.errors.find((error48) => error48.clientNoteId === gardenId);
+        throw new Error(syncError?.message ?? "The server rejected this unpublish request.");
+      }
       await this.requestJson(
         this.buildApiUrl(`/v1/publish/finalize/${syncResponse.batchId}`),
         {
@@ -14498,6 +14552,8 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
         publicUrl: existing?.publicUrl,
         status: "unpublish_queued",
         remoteState: existing?.remoteState,
+        lastErrorCode: void 0,
+        lastError: void 0,
         updatedAt: queuedAt
       };
       await this.savePluginState();
@@ -14524,6 +14580,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
         publicUrl: existing?.publicUrl,
         status: "failed",
         remoteState: existing?.remoteState,
+        lastErrorCode: existing?.lastErrorCode,
         lastError: detail,
         updatedAt: failedAt
       };
@@ -14811,6 +14868,17 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     const remoteSyncUpdatedAt = remote?.syncUpdatedAt ?? record2?.updatedAt ?? runtime?.updatedAt ?? (/* @__PURE__ */ new Date()).toISOString();
     const livePublicUrl = record2?.publicUrl ?? remote?.publicUrl ?? null;
     const hasLivePublicVersion = remote?.state === "published" || remote?.state === "hidden" || record2?.remoteState === "published" || record2?.remoteState === "hidden";
+    const lastErrorCode = remote?.lastErrorCode ?? record2?.lastErrorCode;
+    if (lastErrorCode === "SOURCE_PATH_IDENTITY_CONFLICT" || lastErrorCode === "DUPLICATE_REPAIR_REQUIRED") {
+      return this.buildDescriptor("Conflict: note identity mismatch", [
+        "Notes Garden",
+        `Note: ${title}`,
+        lastErrorCode === "DUPLICATE_REPAIR_REQUIRED" ? "Status: The server found duplicate public documents for this file and needs an admin repair run before publishing again." : "Status: This file was already published under a different garden_id. Notes Garden rejected the new identity to avoid creating a duplicate public note.",
+        "What to do: keep the garden_id in the file as the single source of truth, run Sync published notes again, and ask the admin to repair existing duplicates if needed.",
+        livePublicUrl ? `Current public URL: ${livePublicUrl}` : null,
+        noteId ? `Note ID: ${noteId}` : null
+      ]);
+    }
     if (remoteSyncAction === "delete" && (runtime?.status === "unpublish_queued" || record2?.status === "unpublish_queued" || isPendingSyncItemStatus(remoteSyncStatus))) {
       const isRemoving = remoteSyncStatus === "processing";
       return this.buildDescriptor(isRemoving ? "Removing from garden" : "Unpublish queued", [
@@ -15024,6 +15092,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
         }
       }
       this.publishStateById = nextMap;
+      await this.reconcileLocalSyncedNotes();
       this.lastPublishStateRefreshAt = Date.now();
       if (changed) {
         await this.savePluginState();
@@ -15051,9 +15120,13 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     return (await this.reliableFrontmatterFor(file2))?.publish === true;
   }
   async buildPublishBundle(file2) {
-    const frontmatter = this.frontmatterFor(file2);
+    let raw = await this.app.vault.cachedRead(file2);
+    let frontmatter = parseNoteFrontmatterFromRaw(raw);
     const clientNoteId = await this.ensureGardenId(file2, frontmatter?.garden_id);
-    const raw = await this.app.vault.cachedRead(file2);
+    if (frontmatter?.garden_id !== clientNoteId) {
+      raw = await this.app.vault.cachedRead(file2);
+      frontmatter = parseNoteFrontmatterFromRaw(raw);
+    }
     const markdownRaw = stripFrontmatter(raw);
     const title = extractTitle(markdownRaw) ?? file2.basename;
     const slug = typeof frontmatter?.slug === "string" ? slugify2(frontmatter.slug) : slugify2(title);
@@ -15124,6 +15197,42 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
   findTrackedRecordByPath(sourcePath) {
     return Object.values(this.syncedNotes).find((record2) => record2.sourcePath === sourcePath);
   }
+  async reconcileLocalSyncedNotes() {
+    const recordsByPath = /* @__PURE__ */ new Map();
+    for (const record2 of Object.values(this.syncedNotes)) {
+      const group = recordsByPath.get(record2.sourcePath) ?? [];
+      group.push(record2);
+      recordsByPath.set(record2.sourcePath, group);
+    }
+    const filesByPath = new Map(this.app.vault.getMarkdownFiles().map((file2) => [file2.path, file2]));
+    let changed = false;
+    for (const [sourcePath, records] of recordsByPath.entries()) {
+      if (records.length < 2) {
+        continue;
+      }
+      const file2 = filesByPath.get(sourcePath);
+      if (!file2) {
+        continue;
+      }
+      const frontmatter = await this.reliableFrontmatterFor(file2);
+      const canonicalClientNoteId = frontmatter?.garden_id;
+      if (!canonicalClientNoteId) {
+        continue;
+      }
+      const allowedIds = new Set(records.filter((record2) => record2.clientNoteId === canonicalClientNoteId).map((record2) => record2.clientNoteId));
+      for (const record2 of records) {
+        if (allowedIds.has(record2.clientNoteId)) {
+          continue;
+        }
+        delete this.syncedNotes[record2.clientNoteId];
+        this.runtimeStatuses.delete(record2.clientNoteId);
+        changed = true;
+      }
+    }
+    if (changed) {
+      await this.savePluginState();
+    }
+  }
   async requestJson(url2, request, parser) {
     const response = await this.requestRaw(url2, request);
     return parser ? parser(response.json) : response.json;
@@ -15142,9 +15251,15 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     });
     if (response.status >= 400) {
       const detail = typeof response.json?.error === "string" ? response.json.error : response.text;
-      throw new Error(`Request failed (${response.status}): ${detail}`);
+      throw new Error(this.formatRequestError(response.status, detail));
     }
     return response;
+  }
+  formatRequestError(status, detail) {
+    if (status === 413 && detail.includes("too large to publish")) {
+      return `Ghi ch\xFA qu\xE1 d\xE0i \u0111\u1EC3 publish: ${detail}`;
+    }
+    return `Request failed (${status}): ${detail}`;
   }
   async runWithNotice(task) {
     try {
@@ -15245,6 +15360,38 @@ function normalizePersistedData(raw) {
     },
     syncedNotes: {}
   };
+}
+function normalizePluginSettings(raw) {
+  const candidate = typeof raw === "object" && raw !== null ? raw : {};
+  const normalized = {
+    ...DEFAULT_SETTINGS,
+    serverUrl: typeof candidate.serverUrl === "string" ? candidate.serverUrl.trim() : DEFAULT_SETTINGS.serverUrl,
+    publisherToken: typeof candidate.publisherToken === "string" ? candidate.publisherToken.trim() : DEFAULT_SETTINGS.publisherToken,
+    displayAuthor: typeof candidate.displayAuthor === "string" ? candidate.displayAuthor.trim() : DEFAULT_SETTINGS.displayAuthor,
+    authorSlug: typeof candidate.authorSlug === "string" ? candidate.authorSlug.trim() : DEFAULT_SETTINGS.authorSlug,
+    publishScopeFolder: typeof candidate.publishScopeFolder === "string" ? candidate.publishScopeFolder.trim() || null : candidate.publishScopeFolder === null ? null : DEFAULT_SETTINGS.publishScopeFolder,
+    autoSyncOnStartup: typeof candidate.autoSyncOnStartup === "boolean" ? candidate.autoSyncOnStartup : DEFAULT_SETTINGS.autoSyncOnStartup,
+    syncOnSave: typeof candidate.syncOnSave === "boolean" ? candidate.syncOnSave : DEFAULT_SETTINGS.syncOnSave,
+    includeAttachments: typeof candidate.includeAttachments === "boolean" ? candidate.includeAttachments : DEFAULT_SETTINGS.includeAttachments,
+    maxAssetSizeMb: typeof candidate.maxAssetSizeMb === "number" && Number.isFinite(candidate.maxAssetSizeMb) && candidate.maxAssetSizeMb > 0 && Number.isInteger(candidate.maxAssetSizeMb) ? candidate.maxAssetSizeMb : DEFAULT_SETTINGS.maxAssetSizeMb
+  };
+  if (typeof candidate.defaultLicense === "string" && candidate.defaultLicense.trim()) {
+    normalized.defaultLicense = candidate.defaultLicense.trim();
+  }
+  return normalized;
+}
+function normalizeSyncedNotes(raw) {
+  if (typeof raw !== "object" || raw === null) {
+    return {};
+  }
+  const normalized = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const parsed = pluginSyncRecordSchema.safeParse(value);
+    if (parsed.success) {
+      normalized[key] = parsed.data;
+    }
+  }
+  return normalized;
 }
 function dedupeFiles(files) {
   const map2 = /* @__PURE__ */ new Map();
@@ -15551,6 +15698,7 @@ function mergeRemoteRecord(existing, document2) {
     publicUrl: nextPublicUrl,
     status: nextStatus,
     remoteState: document2.state,
+    lastErrorCode: document2.lastErrorCode ?? (nextStatus === "failed" ? existing?.lastErrorCode : void 0),
     lastError: document2.lastError ?? (nextStatus === "failed" ? existing?.lastError : void 0),
     updatedAt: nextUpdatedAt
   };
@@ -15583,5 +15731,5 @@ function syncRecordsEqual(left, right) {
   if (!left) {
     return false;
   }
-  return left.clientNoteId === right.clientNoteId && left.sourcePath === right.sourcePath && left.slug === right.slug && left.title === right.title && left.contentHash === right.contentHash && left.publicUrl === right.publicUrl && left.status === right.status && left.remoteState === right.remoteState && left.lastError === right.lastError && left.updatedAt === right.updatedAt;
+  return left.clientNoteId === right.clientNoteId && left.sourcePath === right.sourcePath && left.slug === right.slug && left.title === right.title && left.contentHash === right.contentHash && left.publicUrl === right.publicUrl && left.status === right.status && left.remoteState === right.remoteState && left.lastErrorCode === right.lastErrorCode && left.lastError === right.lastError && left.updatedAt === right.updatedAt;
 }
