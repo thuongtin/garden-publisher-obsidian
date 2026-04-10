@@ -13833,6 +13833,7 @@ var publishNoteSchema = external_exports.object({
   excerpt: external_exports.string().trim().default(""),
   tags: external_exports.array(external_exports.string().trim().min(1)).default([]),
   contentHash: external_exports.string().trim().min(1),
+  syncFingerprint: external_exports.string().trim().min(1),
   updatedAt: external_exports.iso.datetime(),
   markdownRaw: external_exports.string(),
   attachments: external_exports.array(attachmentDescriptorSchema).default([])
@@ -13852,6 +13853,11 @@ var acceptedBatchItemSchema = external_exports.object({
   clientNoteId: gardenIdSchema,
   batchItemId: external_exports.string().trim().min(1),
   action: external_exports.enum(["upsert", "delete"])
+});
+var skippedBatchItemSchema = external_exports.object({
+  clientNoteId: gardenIdSchema,
+  action: external_exports.enum(["upsert"]),
+  reason: external_exports.enum(["unchanged"])
 });
 var missingAssetSchema = external_exports.object({
   sha256: external_exports.string().trim().min(1),
@@ -13873,6 +13879,7 @@ var publishSyncResponseSchema = external_exports.object({
   status: external_exports.enum(["pending", "assets_pending", "queued", "processing", "completed", "failed"]),
   accepted: external_exports.array(acceptedBatchItemSchema),
   deletedAccepted: external_exports.array(acceptedBatchItemSchema),
+  skipped: external_exports.array(skippedBatchItemSchema).default([]),
   missingAssets: external_exports.array(missingAssetSchema),
   errors: external_exports.array(syncErrorSchema)
 });
@@ -14062,6 +14069,7 @@ var pluginSyncRecordSchema = external_exports.object({
   slug: external_exports.string().trim().min(1),
   title: external_exports.string().trim().min(1),
   contentHash: external_exports.string().trim().min(1).optional(),
+  syncFingerprint: external_exports.string().trim().min(1).optional(),
   publicUrl: external_exports.string().trim().min(1).optional(),
   status: external_exports.enum(["queued", "synced", "deleted", "failed", "syncing", "unpublish_queued"]),
   remoteState: external_exports.enum(["processing", "published", "deleted", "failed", "hidden"]).optional(),
@@ -14213,7 +14221,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       }))
     )).filter(({ frontmatter }) => frontmatter?.publish === true).map(({ file: file2 }) => file2);
     await this.syncFiles(files, {
-      includeDeleted: true,
+      includeDeleted: false,
       successNotice: true
     });
   }
@@ -14294,17 +14302,26 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       this.inFlightPaths.add(file2.path);
     }
     let bundles = [];
+    let localSkippedBundles = [];
+    let bundlesToSend = [];
     let acceptedBundles = [];
     try {
       bundles = await Promise.all(syncableFiles.map((file2) => this.buildPublishBundle(file2)));
-      if (bundles.length === 0 && deleted.length === 0) {
+      localSkippedBundles = bundles.filter(
+        (bundle) => shouldSkipPublishBundle(bundle, this.syncedNotes[bundle.note.clientNoteId])
+      );
+      const locallySkippedIds = new Set(localSkippedBundles.map((bundle) => bundle.note.clientNoteId));
+      bundlesToSend = bundles.filter((bundle) => !locallySkippedIds.has(bundle.note.clientNoteId));
+      if (bundlesToSend.length === 0 && deleted.length === 0) {
         if (options.successNotice) {
-          new import_obsidian.Notice("No notes to sync.");
+          new import_obsidian.Notice(
+            localSkippedBundles.length > 0 ? `Skipped ${localSkippedBundles.length} unchanged note(s).` : "No notes to sync."
+          );
         }
         return;
       }
       const syncingAt = (/* @__PURE__ */ new Date()).toISOString();
-      for (const bundle of bundles) {
+      for (const bundle of bundlesToSend) {
         this.runtimeStatuses.set(bundle.note.clientNoteId, {
           status: "syncing",
           updatedAt: syncingAt
@@ -14318,7 +14335,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           displayAuthor: this.settings.displayAuthor,
           authorSlug: this.settings.authorSlug
         },
-        notes: bundles.map((bundle) => bundle.note),
+        notes: bundlesToSend.map((bundle) => bundle.note),
         deleted
       });
       const syncResponse = publishSyncResponseSchema.parse(
@@ -14330,9 +14347,11 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       );
       const errorByNoteId = new Map(syncResponse.errors.flatMap((error48) => error48.clientNoteId ? [[error48.clientNoteId, error48]] : []));
       const acceptedNoteIds = new Set(syncResponse.accepted.map((item) => item.clientNoteId));
-      acceptedBundles = bundles.filter((bundle) => acceptedNoteIds.has(bundle.note.clientNoteId));
+      const serverSkippedNoteIds = new Set(syncResponse.skipped.map((item) => item.clientNoteId));
+      acceptedBundles = bundlesToSend.filter((bundle) => acceptedNoteIds.has(bundle.note.clientNoteId));
+      const serverSkippedBundles = bundlesToSend.filter((bundle) => serverSkippedNoteIds.has(bundle.note.clientNoteId));
       const preflightFailedAt = (/* @__PURE__ */ new Date()).toISOString();
-      for (const bundle of bundles) {
+      for (const bundle of bundlesToSend) {
         const syncError = errorByNoteId.get(bundle.note.clientNoteId);
         if (!syncError) {
           continue;
@@ -14348,6 +14367,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           slug: bundle.note.slug,
           title: bundle.note.title,
           contentHash: bundle.note.contentHash,
+          syncFingerprint: bundle.note.syncFingerprint,
           publicUrl: this.syncedNotes[bundle.note.clientNoteId]?.publicUrl,
           status: "failed",
           remoteState: this.syncedNotes[bundle.note.clientNoteId]?.remoteState,
@@ -14378,12 +14398,45 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           slug: bundle.note.slug,
           title: bundle.note.title,
           contentHash: bundle.note.contentHash,
+          syncFingerprint: bundle.note.syncFingerprint,
           publicUrl: existing?.publicUrl ?? this.buildPublicUrl(bundle.note.slug),
           status: "queued",
           remoteState: existing?.remoteState,
           lastErrorCode: void 0,
           lastError: void 0,
           updatedAt: queuedAt
+        };
+      }
+      for (const bundle of serverSkippedBundles) {
+        const existing = this.syncedNotes[bundle.note.clientNoteId];
+        this.runtimeStatuses.delete(bundle.note.clientNoteId);
+        this.syncedNotes[bundle.note.clientNoteId] = {
+          clientNoteId: bundle.note.clientNoteId,
+          sourcePath: bundle.note.sourcePath,
+          slug: bundle.note.slug,
+          title: bundle.note.title,
+          contentHash: bundle.note.contentHash,
+          syncFingerprint: bundle.note.syncFingerprint,
+          publicUrl: existing?.publicUrl ?? this.buildPublicUrl(bundle.note.slug),
+          status: existing?.status === "failed" || existing?.status === "deleted" ? "synced" : existing?.status ?? "synced",
+          remoteState: existing?.remoteState,
+          lastErrorCode: void 0,
+          lastError: void 0,
+          updatedAt: queuedAt
+        };
+      }
+      for (const bundle of localSkippedBundles) {
+        const existing = this.syncedNotes[bundle.note.clientNoteId];
+        if (!existing) {
+          continue;
+        }
+        this.syncedNotes[bundle.note.clientNoteId] = {
+          ...existing,
+          sourcePath: bundle.note.sourcePath,
+          slug: bundle.note.slug,
+          title: bundle.note.title,
+          contentHash: bundle.note.contentHash,
+          syncFingerprint: bundle.note.syncFingerprint
         };
       }
       for (const deletedNote of deleted) {
@@ -14398,6 +14451,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           slug: existing?.slug ?? slugify2(stripMarkdownExtension(basename(deletedNote.sourcePath))),
           title: existing?.title ?? stripMarkdownExtension(basename(deletedNote.sourcePath)),
           contentHash: existing?.contentHash,
+          syncFingerprint: existing?.syncFingerprint,
           publicUrl: existing?.publicUrl,
           status: "unpublish_queued",
           remoteState: existing?.remoteState,
@@ -14413,12 +14467,15 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
       }
       if (options.successNotice) {
         const preflightErrorCount = syncResponse.errors.length;
-        new import_obsidian.Notice(`Queued ${acceptedBundles.length} note(s) and ${deleted.length} deletion(s) for publish.${preflightErrorCount > 0 ? ` ${preflightErrorCount} note(s) need attention.` : ""}`);
+        const skippedCount = localSkippedBundles.length + serverSkippedBundles.length;
+        new import_obsidian.Notice(
+          `Queued ${acceptedBundles.length} note(s) and ${deleted.length} deletion(s) for publish.${skippedCount > 0 ? ` Skipped ${skippedCount} unchanged note(s).` : ""}${preflightErrorCount > 0 ? ` ${preflightErrorCount} note(s) need attention.` : ""}`
+        );
       }
     } catch (error48) {
       const failedAt = (/* @__PURE__ */ new Date()).toISOString();
       const detail = formatErrorMessage(error48);
-      for (const bundle of acceptedBundles.length > 0 ? acceptedBundles : bundles) {
+      for (const bundle of acceptedBundles.length > 0 ? acceptedBundles : bundlesToSend) {
         this.runtimeStatuses.set(bundle.note.clientNoteId, {
           status: "failed",
           updatedAt: failedAt,
@@ -14430,6 +14487,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
           slug: bundle.note.slug,
           title: bundle.note.title,
           contentHash: bundle.note.contentHash,
+          syncFingerprint: bundle.note.syncFingerprint,
           publicUrl: this.syncedNotes[bundle.note.clientNoteId]?.publicUrl ?? this.buildPublicUrl(bundle.note.slug),
           status: "failed",
           remoteState: this.syncedNotes[bundle.note.clientNoteId]?.remoteState,
@@ -14549,6 +14607,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
         slug: existing?.slug ?? slugify2(file2.basename),
         title: existing?.title ?? file2.basename,
         contentHash: existing?.contentHash,
+        syncFingerprint: existing?.syncFingerprint,
         publicUrl: existing?.publicUrl,
         status: "unpublish_queued",
         remoteState: existing?.remoteState,
@@ -14577,6 +14636,7 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
         slug: existing?.slug ?? slugify2(file2.basename),
         title: existing?.title ?? file2.basename,
         contentHash: existing?.contentHash,
+        syncFingerprint: existing?.syncFingerprint,
         publicUrl: existing?.publicUrl,
         status: "failed",
         remoteState: existing?.remoteState,
@@ -15133,19 +15193,22 @@ var GardenPublisherPlugin = class extends import_obsidian.Plugin {
     const excerpt = typeof frontmatter?.excerpt === "string" ? frontmatter.excerpt : extractExcerpt(markdownRaw);
     const tags = Array.isArray(frontmatter?.tags) ? frontmatter.tags : [];
     const uploads = this.settings.includeAttachments ? await this.collectAttachmentUploads(file2, markdownRaw) : [];
+    const note = {
+      clientNoteId,
+      sourcePath: file2.path,
+      title,
+      slug,
+      excerpt,
+      tags,
+      contentHash: await sha256(markdownRaw),
+      syncFingerprint: "",
+      updatedAt: new Date(file2.stat.mtime).toISOString(),
+      markdownRaw,
+      attachments: uploads.map((upload) => upload.descriptor)
+    };
+    note.syncFingerprint = await computePublishSyncFingerprint(note);
     return {
-      note: {
-        clientNoteId,
-        sourcePath: file2.path,
-        title,
-        slug,
-        excerpt,
-        tags,
-        contentHash: await sha256(markdownRaw),
-        updatedAt: new Date(file2.stat.mtime).toISOString(),
-        markdownRaw,
-        attachments: uploads.map((upload) => upload.descriptor)
-      },
+      note,
       uploads
     };
   }
@@ -15685,6 +15748,41 @@ function getStatusBadgeTone(label) {
     border: "var(--background-modifier-border)"
   };
 }
+async function computePublishSyncFingerprint(note) {
+  const normalized = {
+    sourcePath: note.sourcePath,
+    title: note.title,
+    slug: note.slug,
+    excerpt: note.excerpt,
+    tags: [...note.tags].map((tag) => tag.trim().toLowerCase()).sort(),
+    markdownRaw: note.markdownRaw,
+    attachments: [...note.attachments].map((attachment) => ({
+      sourcePath: attachment.sourcePath,
+      sha256: attachment.sha256,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes,
+      filename: attachment.filename
+    })).sort(
+      (left, right) => left.sourcePath.localeCompare(right.sourcePath) || left.sha256.localeCompare(right.sha256)
+    )
+  };
+  return sha256(JSON.stringify(normalized));
+}
+function shouldSkipPublishBundle(bundle, existing) {
+  if (!existing?.syncFingerprint || existing.syncFingerprint !== bundle.note.syncFingerprint) {
+    return false;
+  }
+  if (existing.lastErrorCode || existing.lastError) {
+    return false;
+  }
+  if (existing.status === "failed" || existing.status === "queued" || existing.status === "unpublish_queued" || existing.status === "deleted") {
+    return false;
+  }
+  if (existing.remoteState && existing.remoteState !== "published" && existing.remoteState !== "hidden") {
+    return false;
+  }
+  return existing.status === "synced" || existing.remoteState === "published" || existing.remoteState === "hidden";
+}
 function mergeRemoteRecord(existing, document2) {
   const nextStatus = resolveStatusFromRemote(existing, document2);
   const nextPublicUrl = document2.publicUrl ?? (document2.state === "deleted" ? void 0 : existing?.publicUrl);
@@ -15695,6 +15793,7 @@ function mergeRemoteRecord(existing, document2) {
     slug: document2.slug,
     title: document2.title,
     contentHash: document2.lastContentHash ?? existing?.contentHash,
+    syncFingerprint: existing?.syncFingerprint,
     publicUrl: nextPublicUrl,
     status: nextStatus,
     remoteState: document2.state,
@@ -15731,5 +15830,5 @@ function syncRecordsEqual(left, right) {
   if (!left) {
     return false;
   }
-  return left.clientNoteId === right.clientNoteId && left.sourcePath === right.sourcePath && left.slug === right.slug && left.title === right.title && left.contentHash === right.contentHash && left.publicUrl === right.publicUrl && left.status === right.status && left.remoteState === right.remoteState && left.lastErrorCode === right.lastErrorCode && left.lastError === right.lastError && left.updatedAt === right.updatedAt;
+  return left.clientNoteId === right.clientNoteId && left.sourcePath === right.sourcePath && left.slug === right.slug && left.title === right.title && left.contentHash === right.contentHash && left.syncFingerprint === right.syncFingerprint && left.publicUrl === right.publicUrl && left.status === right.status && left.remoteState === right.remoteState && left.lastErrorCode === right.lastErrorCode && left.lastError === right.lastError && left.updatedAt === right.updatedAt;
 }

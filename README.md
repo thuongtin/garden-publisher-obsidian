@@ -141,6 +141,6 @@ https://notes-garden.ecom.io.vn/<author-slug>/<note-slug>
 ## Notes
 
 - `garden_id` is the stable identity of a note. Do not remove it after the first publish.
+- Bulk sync is incremental: unchanged published notes are skipped instead of being re-uploaded every time.
 - If a sync fails, the previous live version can remain public until the next successful publish or explicit unpublish.
 - Large notes with many attachments, Mermaid blocks, or heavy link resolution can stay in `Processing on server` longer than usual.
-
